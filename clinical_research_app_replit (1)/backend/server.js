@@ -11,6 +11,7 @@ const patientRoutes = require('./routes/patientRoutes');
 const financialRoutes = require('./routes/financialRoutes');
 const userRoutes = require('./routes/userRoutes');
 const reportRoutes = require('./routes/reportRoutes');
+const deidentRoutes = require('./routes/deidentRoutes');
 
 // Initialize express app
 const app = express();
@@ -28,6 +29,7 @@ app.use('/api/patients', patientRoutes);
 app.use('/api/financial', financialRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/deident', deidentRoutes);
 
 // Root route
 app.get('/', (req, res) => {
@@ -38,7 +40,8 @@ app.get('/', (req, res) => {
       patients: '/api/patients',
       financial: '/api/financial',
       users: '/api/users',
-      reports: '/api/reports'
+      reports: '/api/reports',
+      deident: '/api/deident'
     }
   });
 });
