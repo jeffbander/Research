@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
+const { encrypt, decrypt } = require('../utils/encryption');
 
 const aigentsConfigSchema = new Schema({
   name: {
@@ -50,6 +51,24 @@ aigentsConfigSchema.methods.toSafeJSON = function () {
   const obj = this.toObject();
   delete obj.auth_token;
   return obj;
+};
+
+// Token is encrypted at rest. Encryption only triggers when the field
+// changes, so re-saves of a loaded doc don't double-encrypt.
+aigentsConfigSchema.pre('save', function (next) {
+  if (this.isModified('auth_token') && this.auth_token) {
+    try {
+      this.auth_token = encrypt(this.auth_token);
+    } catch (err) {
+      return next(err);
+    }
+  }
+  next();
+});
+
+aigentsConfigSchema.methods.decryptedToken = function () {
+  if (!this.auth_token) return null;
+  return decrypt(this.auth_token);
 };
 
 module.exports = mongoose.model('AigentsConfig', aigentsConfigSchema);

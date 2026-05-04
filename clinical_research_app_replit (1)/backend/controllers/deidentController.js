@@ -1,5 +1,6 @@
 const DeidentAudit = require('../models/deidentAuditModel');
 const AigentsConfig = require('../models/aigentsConfigModel');
+const PhiPolicy = require('../models/phiPolicyModel');
 
 // ---------- Audit log ----------
 
@@ -125,13 +126,19 @@ exports.createAigentsConfig = async (req, res) => {
 
 exports.updateAigentsConfig = async (req, res) => {
   try {
-    const config = await AigentsConfig.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-      runValidators: true
-    });
+    // Use save() instead of findByIdAndUpdate so the pre-save encryption
+    // hook fires when auth_token changes.
+    const config = await AigentsConfig.findById(req.params.id).select('+auth_token');
     if (!config) {
       return res.status(404).json({ success: false, message: 'Aigents config not found' });
     }
+    const editable = ['name', 'webhook_url', 'auth_type', 'auth_token',
+                      'default_chain_title', 'default_folder_id',
+                      'description', 'is_active'];
+    for (const field of editable) {
+      if (req.body[field] !== undefined) config[field] = req.body[field];
+    }
+    await config.save();
     res.status(200).json({ success: true, data: config.toSafeJSON() });
   } catch (error) {
     res.status(400).json({
@@ -153,6 +160,100 @@ exports.deleteAigentsConfig = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to delete Aigents config',
+      error: error.message
+    });
+  }
+};
+
+// ---------- PHI policies (server-stored) ----------
+
+exports.listPhiPolicies = async (req, res) => {
+  try {
+    const filter = { is_active: true };
+    if (req.query.study) filter.study = req.query.study;
+    if (req.query.irb_protocol) filter.irb_protocol = req.query.irb_protocol;
+    const policies = await PhiPolicy.find(filter).populate('study', 'studyId name shortTitle');
+    res.status(200).json({
+      success: true,
+      count: policies.length,
+      data: policies,
+      meta: {
+        locked_categories: PhiPolicy.LOCKED_CATEGORIES,
+        optional_categories: PhiPolicy.OPTIONAL_CATEGORIES
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve PHI policies',
+      error: error.message
+    });
+  }
+};
+
+exports.getPhiPolicy = async (req, res) => {
+  try {
+    const policy = await PhiPolicy.findById(req.params.id)
+      .populate('study', 'studyId name shortTitle');
+    if (!policy) {
+      return res.status(404).json({ success: false, message: 'PHI policy not found' });
+    }
+    res.status(200).json({ success: true, data: policy });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve PHI policy',
+      error: error.message
+    });
+  }
+};
+
+exports.createPhiPolicy = async (req, res) => {
+  try {
+    const policy = await PhiPolicy.create({
+      ...req.body,
+      created_by: req.user?.id
+    });
+    res.status(201).json({ success: true, data: policy });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: 'Failed to create PHI policy',
+      error: error.message
+    });
+  }
+};
+
+exports.updatePhiPolicy = async (req, res) => {
+  try {
+    const policy = await PhiPolicy.findByIdAndUpdate(req.params.id, req.body, {
+      new: true,
+      runValidators: true
+    });
+    if (!policy) {
+      return res.status(404).json({ success: false, message: 'PHI policy not found' });
+    }
+    res.status(200).json({ success: true, data: policy });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: 'Failed to update PHI policy',
+      error: error.message
+    });
+  }
+};
+
+exports.deletePhiPolicy = async (req, res) => {
+  try {
+    const policy = await PhiPolicy.findByIdAndDelete(req.params.id);
+    if (!policy) {
+      return res.status(404).json({ success: false, message: 'PHI policy not found' });
+    }
+    res.status(200).json({ success: true, message: 'PHI policy deleted' });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete PHI policy',
       error: error.message
     });
   }
@@ -185,10 +286,11 @@ exports.forwardToAigents = async (req, res) => {
     }
 
     const headers = { 'Content-Type': 'application/json' };
-    if (config.auth_type === 'bearer' && config.auth_token) {
-      headers.Authorization = `Bearer ${config.auth_token}`;
-    } else if (config.auth_type === 'basic' && config.auth_token) {
-      headers.Authorization = `Basic ${config.auth_token}`;
+    const token = config.decryptedToken();
+    if (config.auth_type === 'bearer' && token) {
+      headers.Authorization = `Bearer ${token}`;
+    } else if (config.auth_type === 'basic' && token) {
+      headers.Authorization = `Basic ${token}`;
     }
 
     const upstream = await fetch(config.webhook_url, {
