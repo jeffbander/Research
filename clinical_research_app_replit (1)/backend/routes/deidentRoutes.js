@@ -15,7 +15,9 @@ const {
   getPhiPolicy,
   createPhiPolicy,
   updatePhiPolicy,
-  deletePhiPolicy
+  deletePhiPolicy,
+  getChainRunReport,
+  generateSyntheticChart
 } = require('../controllers/deidentController');
 
 // Audit log — auth required because it ties cleansing events to users
@@ -41,5 +43,11 @@ router.delete('/policies/:id', protect, authorize('admin'), deletePhiPolicy);
 
 // Forward cleansed payload to Aigents (server attaches stored auth)
 router.post('/forward', protect, forwardToAigents);
+
+// IRB-style chain-run report (audits with chain_run_id set)
+router.get('/chain-runs', protect, getChainRunReport);
+
+// Synthetic clinical document for demo / stress test. Public — fake data only.
+router.get('/fixtures/synthetic-chart', generateSyntheticChart);
 
 module.exports = router;
