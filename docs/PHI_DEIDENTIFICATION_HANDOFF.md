@@ -281,6 +281,164 @@ End-to-end smoke test for the research-app implementation:
 
 ---
 
+## Configurable PHI policy
+
+The current scrubber over-redacts because the prompt is open-ended ("redact anything that could identify a patient"). Replace it with an enumerated, user-configurable policy: a small floor of always-redacted categories, and everything else as a toggle.
+
+**Floor (locked, always redacted):** Patient name, DOB, SSN.
+**Optional (user toggles):** MRN, provider/doctor names, visit dates, phone, email, address, ages > 89, account/device IDs, relative names, employer, URLs/IPs, biometric IDs, photo refs, other unique IDs.
+
+Presets:
+- `safe_harbor` — every optional category on. Output is HIPAA Safe Harbor compliant.
+- `internal_research` — preserve MRN, provider names, visit dates for record linkage; redact everything else. Output is NOT Safe Harbor.
+- `minimal` — only the locked floor. For workflows where the lab needs maximum context and has IRB coverage.
+
+### Types and prompt builder
+
+```ts
+// lib/phi-policy.ts
+
+/** Categories that are ALWAYS redacted. Not user-configurable. */
+export const LOCKED_CATEGORIES = ['PATIENT_NAME', 'DOB', 'SSN'] as const;
+
+/** Categories the user can choose to preserve or redact. */
+export const OPTIONAL_CATEGORIES = [
+  'MRN',
+  'PROVIDER_NAME',
+  'VISIT_DATE',
+  'PHONE',
+  'EMAIL',
+  'ADDRESS',
+  'AGE_OVER_89',
+  'ACCOUNT_NUMBER',
+  'DEVICE_ID',
+  'RELATIVE_NAME',
+  'EMPLOYER_NAME',
+  'URL_OR_IP',
+  'BIOMETRIC_ID',
+  'FACIAL_PHOTO_REF',
+  'OTHER_UNIQUE_ID',
+] as const;
+
+export type LockedCategory = typeof LOCKED_CATEGORIES[number];
+export type OptionalCategory = typeof OPTIONAL_CATEGORIES[number];
+export type PhiCategory = LockedCategory | OptionalCategory;
+
+export interface PhiPolicy {
+  /** Map of optional category -> whether to redact it. Locked cats are implicit. */
+  redact: Record<OptionalCategory, boolean>;
+  /** Free-form notes the user wants in the audit log (e.g. "IRB #2024-118"). */
+  notes?: string;
+}
+
+export const PRESETS: Record<string, PhiPolicy> = {
+  safe_harbor: {
+    redact: Object.fromEntries(OPTIONAL_CATEGORIES.map(c => [c, true])) as PhiPolicy['redact'],
+  },
+  internal_research: {
+    redact: {
+      MRN: false,
+      PROVIDER_NAME: false,
+      VISIT_DATE: false,
+      PHONE: true, EMAIL: true, ADDRESS: true, AGE_OVER_89: true,
+      ACCOUNT_NUMBER: true, DEVICE_ID: true, RELATIVE_NAME: true,
+      EMPLOYER_NAME: true, URL_OR_IP: true, BIOMETRIC_ID: true,
+      FACIAL_PHOTO_REF: true, OTHER_UNIQUE_ID: true,
+    },
+  },
+  minimal: {
+    redact: Object.fromEntries(OPTIONAL_CATEGORIES.map(c => [c, false])) as PhiPolicy['redact'],
+  },
+};
+
+export function isSafeHarborCompliant(policy: PhiPolicy): boolean {
+  return OPTIONAL_CATEGORIES.every(c => policy.redact[c]);
+}
+```
+
+```ts
+// lib/phi-scrub-prompt.ts
+
+import { LOCKED_CATEGORIES, OPTIONAL_CATEGORIES, PhiPolicy } from './phi-policy';
+
+const CATEGORY_DESCRIPTIONS: Record<string, string> = {
+  PATIENT_NAME: "the patient's full name, first name, last name, nicknames, initials",
+  DOB:          "date of birth in any format",
+  SSN:          "Social Security Numbers in any format",
+  MRN:          "medical record numbers, chart numbers, patient IDs",
+  PROVIDER_NAME:"names of physicians, nurses, and other clinical staff (Dr., NP, PA, RN)",
+  VISIT_DATE:   "admission, discharge, encounter, procedure, and follow-up dates",
+  PHONE:        "telephone and fax numbers",
+  EMAIL:        "email addresses",
+  ADDRESS:      "street addresses, cities, ZIP codes (any geographic detail finer than state)",
+  AGE_OVER_89:  "ages 90 and above (replace with 'over 89')",
+  ACCOUNT_NUMBER:"health plan, account, certificate, and license numbers",
+  DEVICE_ID:    "device serial numbers, implant identifiers",
+  RELATIVE_NAME:"names of family members, household members, employers' contacts",
+  EMPLOYER_NAME:"names of the patient's employer",
+  URL_OR_IP:    "web URLs and IP addresses tied to the patient",
+  BIOMETRIC_ID: "fingerprints, voiceprints, retina scans",
+  FACIAL_PHOTO_REF:"references to identifying photos",
+  OTHER_UNIQUE_ID:"any other unique identifier or code",
+};
+
+export function buildSystemPrompt(policy: PhiPolicy): string {
+  const toRedact = [
+    ...LOCKED_CATEGORIES,
+    ...OPTIONAL_CATEGORIES.filter(c => policy.redact[c]),
+  ];
+  const toPreserve = OPTIONAL_CATEGORIES.filter(c => !policy.redact[c]);
+
+  const redactList = toRedact
+    .map(c => `- [${c}] — ${CATEGORY_DESCRIPTIONS[c]}`)
+    .join('\n');
+
+  const preserveList = toPreserve.length
+    ? toPreserve.map(c => `- ${CATEGORY_DESCRIPTIONS[c]}`).join('\n')
+    : '(none — redact everything listed above)';
+
+  return `You are a PHI redaction tool. Process the user's clinical text and return it with ONLY the following categories replaced by bracketed placeholders.
+
+REDACT these categories (replace with [CATEGORY-N] placeholders, numbered consistently):
+${redactList}
+
+PRESERVE these verbatim — do NOT redact, do NOT alter:
+${preserveList}
+
+Rules:
+1. Only redact categories listed in REDACT above. Do not invent new categories.
+2. Output the full text with substitutions in place. Preserve all formatting, line breaks, and clinical content.
+3. Use stable numbering: the first patient name encountered is [PATIENT_NAME-1], second distinct person is [PATIENT_NAME-2], etc.
+4. If a category in PRESERVE could arguably be PHI in some other context, still preserve it — the user has explicitly opted in.
+5. Do not add commentary. Output only the transformed text.`;
+}
+```
+
+### Audit log fields the policy adds
+
+```ts
+auditLog.policy = {
+  preset: presetName,                              // 'safe_harbor' | 'internal_research' | 'minimal' | 'custom'
+  is_safe_harbor: isSafeHarborCompliant(policy),
+  redacted_categories: [...LOCKED_CATEGORIES, ...optionalRedacted],
+  preserved_categories: optionalPreserved,
+  notes: policy.notes,
+};
+```
+
+When `is_safe_harbor: false`, the UI should display a persistent banner ("Output is NOT Safe Harbor compliant — appropriate only for internal research with IRB coverage") and the Aigents handoff payload should carry the same flag so downstream chains can refuse to treat it as publishable.
+
+### Settings UI
+
+`components/settings/PhiPolicyPanel.tsx`:
+- Preset selector (radio group): Safe Harbor / Internal Research / Minimal / Custom.
+- For each optional category: a toggle row showing the description and current state. Selecting any custom value flips the preset to "Custom."
+- Notes textarea (e.g. for IRB #).
+- Live preview pane that shows the rebuilt system prompt so power users can verify what the model will be told.
+- Save button writes to localStorage and rebuilds the engine's system prompt on next chunk.
+
+---
+
 ## Where this gets built
 
 When the time comes:
