@@ -10,8 +10,15 @@ import {
   type FieldProgress
 } from '@/lib/scrub-engine';
 import { IdentifierMap } from '@/lib/identifier-map';
-import { PRESETS, isSafeHarborCompliant } from '@/lib/phi-policy';
+import {
+  PRESETS,
+  isSafeHarborCompliant,
+  OPTIONAL_CATEGORIES,
+  type PhiPolicy
+} from '@/lib/phi-policy';
 import { sha256 } from '@/lib/hash';
+import { generateSyntheticChart } from '@/lib/synthetic-chart';
+import PolicySelector from './PolicySelector';
 
 type EngineState = 'idle' | 'loading' | 'ready' | 'error';
 
@@ -35,6 +42,8 @@ export default function ResearchExtractionApp() {
   const [engineState, setEngineState] = useState<EngineState>('idle');
   const [loadProgress, setLoadProgress] = useState<{ pct: number; text: string }>({ pct: 0, text: '' });
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const [policy, setPolicy] = useState<PhiPolicy>(PRESETS.internal_research);
 
   const [inputs, setInputs] = useState<Record<FieldKey, string>>({
     notes: '', procedures: '', labs: ''
@@ -72,13 +81,29 @@ export default function ResearchExtractionApp() {
     }
   }
 
+  function handleLoadDemoData() {
+    const chart = generateSyntheticChart({ pages: 3 });
+    setInputs({
+      notes: chart.notes,
+      procedures: chart.procedures,
+      labs: chart.labs
+    });
+    setCleansed({ notes: '', procedures: '', labs: '' });
+    setProgress({
+      notes:      { field: 'notes',      status: 'pending', chunksTotal: 0, chunksDone: 0, redactions: 0 },
+      procedures: { field: 'procedures', status: 'pending', chunksTotal: 0, chunksDone: 0, redactions: 0 },
+      labs:       { field: 'labs',       status: 'pending', chunksTotal: 0, chunksDone: 0, redactions: 0 }
+    });
+    setAuditId(null);
+    setForwardResult(null);
+  }
+
   async function handleScrubAll() {
     if (engineState !== 'ready') return;
     setBusy(true);
     setForwardResult(null);
     setAuditId(null);
 
-    const policy = PRESETS.internal_research;
     const map = new IdentifierMap();
     const newCleansed: Record<FieldKey, string> = { notes: '', procedures: '', labs: '' };
     const fieldOrder: FieldKey[] = ['notes', 'procedures', 'labs'];
@@ -108,6 +133,9 @@ export default function ResearchExtractionApp() {
       const inputSha  = await sha256(fieldOrder.map(f => inputs[f]).join('\n---\n'));
       const outputSha = await sha256(fieldOrder.map(f => newCleansed[f]).join('\n---\n'));
 
+      const redactedCats = OPTIONAL_CATEGORIES.filter(c => policy.redact[c]);
+      const preservedCats = OPTIONAL_CATEGORIES.filter(c => !policy.redact[c]);
+
       const id = await createAudit({
         doc_id: crypto.randomUUID(),
         fields: {
@@ -123,13 +151,10 @@ export default function ResearchExtractionApp() {
         model_used: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',
         elapsed_ms: elapsedMs,
         policy: {
-          preset: 'internal_research',
+          preset: presetNameFor(policy),
           is_safe_harbor: isSafeHarborCompliant(policy),
-          redacted_categories: ['PATIENT_NAME', 'DOB', 'SSN', 'PHONE', 'EMAIL', 'ADDRESS',
-                                'AGE_OVER_89', 'ACCOUNT_NUMBER', 'DEVICE_ID', 'RELATIVE_NAME',
-                                'EMPLOYER_NAME', 'URL_OR_IP', 'BIOMETRIC_ID',
-                                'FACIAL_PHOTO_REF', 'OTHER_UNIQUE_ID'],
-          preserved_categories: ['MRN', 'PROVIDER_NAME', 'VISIT_DATE']
+          redacted_categories: ['PATIENT_NAME', 'DOB', 'SSN', ...redactedCats],
+          preserved_categories: preservedCats
         }
       });
       setAuditId(id as string);
@@ -188,9 +213,10 @@ export default function ResearchExtractionApp() {
       <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
         <strong>Synthetic / authorized research data only.</strong> This tool de-identifies text in
         your browser via a local AI model — no PHI is sent to any server until you click Send to
-        Aigents, at which point the cleansed text (with names, DOBs, etc. redacted) is forwarded
-        for analysis.
+        Aigents, at which point the cleansed text is forwarded for analysis.
       </div>
+
+      <PolicySelector policy={policy} onChange={setPolicy} />
 
       <section className="rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-lg font-semibold mb-2">1. Load the local model</h2>
@@ -224,7 +250,16 @@ export default function ResearchExtractionApp() {
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-        <h2 className="text-lg font-semibold mb-4">2. Paste source text into each field</h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold">2. Paste source text into each field</h2>
+          <button
+            type="button"
+            onClick={handleLoadDemoData}
+            className="text-xs px-3 py-1.5 rounded-md border border-zinc-300 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Load synthetic demo data
+          </button>
+        </div>
         <div className="space-y-4">
           {(['notes', 'procedures', 'labs'] as FieldKey[]).map(field => (
             <FieldInput
@@ -254,9 +289,8 @@ export default function ResearchExtractionApp() {
         <h2 className="text-lg font-semibold mb-4">3. Send to Aigents</h2>
         {configs.length === 0 ? (
           <div className="text-sm text-zinc-600 dark:text-zinc-400">
-            No Aigents configs available. An admin needs to create one (call{' '}
-            <code className="px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">api.aigentsConfigsAdmin.create</code>{' '}
-            via the Convex dashboard or CLI).
+            No Aigents configs available. An admin needs to add one in the{' '}
+            <a href="/admin" className="text-blue-600 dark:text-blue-400 hover:underline">admin page</a>.
           </div>
         ) : (
           <div className="space-y-4">
@@ -307,6 +341,13 @@ export default function ResearchExtractionApp() {
       </section>
     </div>
   );
+}
+
+function presetNameFor(policy: PhiPolicy): string {
+  for (const [name, preset] of Object.entries(PRESETS)) {
+    if (OPTIONAL_CATEGORIES.every(c => preset.redact[c] === policy.redact[c])) return name;
+  }
+  return 'custom';
 }
 
 function fieldStatsFor(
