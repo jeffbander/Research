@@ -3,73 +3,108 @@
 Next.js app for browser-side PHI de-identification with Aigents handoff.
 The page at `/research-extraction` accepts three pasted fields (Notes,
 Procedures, Laboratory Results), de-identifies them locally via WebGPU +
-Llama 3.2, then forwards the cleansed payload to a configured Aigents
-chain. PHI never reaches a server.
+Llama 3.2, then triggers a configured Aigents chain run with the
+cleansed text. PHI never reaches a server.
 
 ## Stack
 
 - Next.js 14 (App Router) on Vercel
-- Clerk for auth
-- MongoDB Atlas (Mongoose) for AigentsConfig + DeidentAudit + PhiPolicy
+- Convex for the database, server functions, and external HTTP calls
+- Clerk for auth (bridged to Convex via JWT)
 - @mlc-ai/web-llm for in-browser inference
+
+There are no Next.js API routes. The browser calls Convex queries,
+mutations, and actions directly via `useQuery` / `useMutation` / `useAction`.
 
 ## First-time setup
 
-1. **Clerk** — create a project at https://dashboard.clerk.com. Copy
-   `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`.
-2. **MongoDB Atlas** — create a free M0 cluster, add a database user, add
-   `0.0.0.0/0` to the network access list (or Vercel's egress IPs). Copy
-   the connection string.
+1. **Clerk** — create an application at https://dashboard.clerk.com.
+   - Copy `Publishable Key` → `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+   - Copy `Secret Key` → `CLERK_SECRET_KEY`
+   - In **JWT Templates**, create a template named exactly `convex`.
+     Copy the **Issuer URL** for `CLERK_JWT_ISSUER_DOMAIN` (e.g.
+     `https://moving-coyote-12.clerk.accounts.dev`).
+2. **Convex** — sign up at https://dashboard.convex.dev.
 3. **Encryption key** — generate one:
    ```bash
    node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
    ```
-4. Copy `.env.example` to `.env.local` and fill in the values.
+4. Copy `.env.example` to `.env.local` and fill in `NEXT_PUBLIC_*` and
+   Clerk values. Leave Convex-side env vars for step 6.
 5. `npm install`
-6. Seed an AigentsConfig:
+6. **Bootstrap Convex** (one time):
    ```bash
-   AIGENTS_WEBHOOK_URL=https://aigents.example.com/webhook \
-   AIGENTS_TOKEN=<your-bearer-token> \
-   AIGENTS_CHAIN_TITLE=research_extraction_chain \
-   npm run seed:aigents
+   npm run convex:dev
    ```
-7. `npm run dev` → http://localhost:3000
+   This logs you in, creates a deployment, generates `convex/_generated/`,
+   pushes the schema, and runs in watch mode. Leave it running. Then in
+   the Convex dashboard for that deployment, set environment variables:
+   - `DEIDENT_ENCRYPTION_KEY` — from step 3
+   - `CLERK_JWT_ISSUER_DOMAIN` — from step 1
+   - `CLERK_ADMIN_USER_IDS` — your Clerk user ID (after first sign-in,
+     comma-separated for multiple admins)
+7. In a second terminal: `npm run dev` → http://localhost:3000
 
 ## Vercel deploy
 
-1. Push this directory to a GitHub repo (or set Root Directory =
-   `research-extraction-app` if deploying the whole monorepo).
-2. Add the env vars from `.env.example` to Vercel's project settings.
-3. Add your Clerk user ID to `CLERK_ADMIN_USER_IDS` so you can manage
-   AigentsConfigs without seeding.
-4. Deploy. The first user to sign in becomes a regular user; admins are
-   only those listed in `CLERK_ADMIN_USER_IDS`.
+1. Push this directory to GitHub.
+2. **Vercel** → Import the repo.
+   - **Root Directory** = `research-extraction-app` (if monorepo)
+   - **Build Command** = `npx convex deploy --cmd 'npm run build'`
+     (so Convex pushes the latest schema/functions on every Vercel build)
+3. In Vercel **Settings → Environment Variables**, add:
+   - `NEXT_PUBLIC_CONVEX_URL`
+   - `CONVEX_DEPLOY_KEY` (from Convex dashboard → Deployment Settings)
+   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+   - `CLERK_SECRET_KEY`
+4. Convex-side env vars (`DEIDENT_ENCRYPTION_KEY`,
+   `CLERK_JWT_ISSUER_DOMAIN`, `CLERK_ADMIN_USER_IDS`) live in the
+   Convex dashboard, not Vercel.
+5. Deploy. After your first sign-in, grab your Clerk user ID and add
+   it to `CLERK_ADMIN_USER_IDS` in Convex.
 
-## API surface
+## Creating an AigentsConfig
 
-All routes require auth. Admin = listed in `CLERK_ADMIN_USER_IDS`.
+After bootstrap, run the action from the Convex dashboard
+(Functions → `aigentsConfigsAdmin:create`) or via the CLI:
 
-| Method | Path                                  | Who    | Purpose |
-| ------ | ------------------------------------- | ------ | ------- |
-| POST   | `/api/deident/audit`                  | user   | Persist a cleansing event |
-| GET    | `/api/deident/audit`                  | user   | List the caller's audit records |
-| GET    | `/api/deident/aigents-configs`        | user   | List active configs (no tokens) |
-| GET    | `/api/deident/aigents-configs/:id`    | user   | Get one config (no token) |
-| POST   | `/api/deident/aigents-configs`        | admin  | Create a config (token encrypted at rest) |
-| PUT    | `/api/deident/aigents-configs/:id`    | admin  | Update a config |
-| DELETE | `/api/deident/aigents-configs/:id`    | admin  | Delete a config |
-| GET    | `/api/deident/policies`               | user   | List PHI policies + LOCKED/OPTIONAL category lists |
-| POST   | `/api/deident/forward`                | user   | Forward a cleansed payload to Aigents (server attaches stored token) |
+```bash
+npx convex run aigentsConfigsAdmin:create '{
+  "name": "default",
+  "webhook_url": "https://aigents.example.com/webhook",
+  "auth_type": "bearer",
+  "auth_token": "<your-bearer-token>",
+  "default_chain_title": "research_extraction_chain"
+}'
+```
+
+The token is encrypted with AES-256-GCM before being written to the
+database (the action runs in Node runtime to access `crypto`).
+
+## Convex function map
+
+| Function                                   | Kind              | Who   | Purpose |
+| ------------------------------------------ | ----------------- | ----- | ------- |
+| `aigentsConfigs.list`                      | query             | user  | List active configs (no tokens) |
+| `aigentsConfigs.get`                       | query             | user  | Get one config (no token) |
+| `aigentsConfigsAdmin.create`               | action (Node)     | admin | Create a config; encrypts token |
+| `aigentsConfigsAdmin.update`               | action (Node)     | admin | Update a config; re-encrypts on token change |
+| `aigentsConfigsAdmin.remove`               | action            | admin | Delete a config |
+| `audits.create`                            | mutation          | user  | Persist a cleansing event |
+| `audits.listForUser`                       | query             | user  | List the caller's audit records |
+| `policies.list`                            | query             | user  | List PHI policies + LOCKED/OPTIONAL category lists |
+| `forward.send`                             | action (Node)     | user  | Decrypt token, POST cleansed payload to Aigents, link chain run |
+| `aigentsConfigs.*Internal`, `audits.linkChainRunInternal` | internal | —     | Helpers used only by actions |
 
 ## Aigents chain contract
 
-The page sends to `/api/deident/forward`, which posts to the AigentsConfig's
-`webhook_url`. The payload is shaped to match Aigents `start_chain_run`:
+The page sends a single payload to `forward.send` (Convex action), which
+posts to the AigentsConfig's `webhook_url`. The shape:
 
 ```json
 {
   "source_name": "research_extraction",
-  "source_id": "<uuid>",
+  "source_id": "<audit_id or uuid>",
   "chain_title": "<from config or override>",
   "first_step_user_input": "Process patient extraction",
   "starting_variables": {
@@ -80,37 +115,38 @@ The page sends to `/api/deident/forward`, which posts to the AigentsConfig's
 }
 ```
 
-The variable names are configurable per AigentsConfig record so existing
-chains can plug in whatever variable names they already use.
+Variable names are configurable per AigentsConfig record so existing
+chains plug in their own variable names without code changes.
 
 ## How the de-identification works
 
-1. The page loads Llama 3.2 3B (q4f16_1) via WebGPU. ~2 GB download on
-   first visit, cached in IndexedDB after that.
+1. The page loads Llama 3.2 3B via WebGPU. ~2 GB download on first
+   visit, cached in IndexedDB after that.
 2. For each of the three fields, the text is split into ~1500-token
    chunks with a ~600-char overlap tail.
 3. Each chunk is scrubbed with a system prompt that enumerates exactly
-   which PHI categories to redact and which to preserve. The current
-   default preset is `internal_research` — patient name + DOB + SSN
-   redacted; MRN, provider names, and visit dates preserved.
+   which PHI categories to redact and which to preserve. The default
+   preset is `internal_research` — patient name + DOB + SSN redacted;
+   MRN, provider names, and visit dates preserved.
 4. The model outputs `[CATEGORY: original-text]` markers; a shared
    `IdentifierMap` walks all three fields and consolidates each unique
-   value to a stable `[CATEGORY-N]` placeholder. So "John Sample" in
+   value to a stable `[CATEGORY-N]` placeholder, so "John Sample" in
    Notes and Procedures becomes the same `[PATIENT_NAME-1]`.
 5. Output chunks are stitched with overlap-aware deduplication.
-6. An audit record is POSTed to `/api/deident/audit` with input/output
-   SHA-256 hashes, redaction counts per category, and the policy
-   snapshot.
-7. On Send to Aigents, the cleansed strings + metadata are posted to
-   `/api/deident/forward`. The server attaches the bearer token (decrypted
-   from Mongo) and posts to the configured webhook. Returned chain run
-   ID is shown in the UI and back-linked onto the audit record.
+6. An audit record is created via `audits.create` with input/output
+   SHA-256 hashes and per-category redaction counts.
+7. On Send to Aigents, the cleansed strings + audit id flow into
+   `forward.send`. The action decrypts the bearer token (read inside
+   the Convex Node runtime, never exposed to the browser), posts to
+   the configured webhook, and writes the returned chain_run_id back
+   onto the audit record.
 
-## What is NOT in v1
+## Why Convex (vs the previous Mongo + REST API design)
 
-- Per-user PHI policy override UI (uses the hardcoded `internal_research`
-  preset; backend supports policy CRUD already, just no UI yet)
-- Discovery-pass two-pass scrubbing for higher cross-chunk consistency
-- Streaming results back from Aigents — check the Aigents UI for output
-- File uploads (paste-only)
-- Multi-language clinical text
+- One backend instead of two (no Next.js API routes, no Mongoose
+  bootstrap, no Atlas connection caching)
+- Auth bridge to Clerk is built-in via `ConvexProviderWithClerk`
+- Reactive queries — UI auto-updates when an admin adds an AigentsConfig
+- Bearer token never leaves the Convex Node runtime, encryption stays
+  on the function side
+- Schema validation is enforced by Convex at the function boundary

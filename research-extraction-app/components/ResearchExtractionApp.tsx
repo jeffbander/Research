@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useQuery, useMutation, useAction } from 'convex/react';
+import { api } from '@/convex/_generated/api';
 import {
   loadEngine,
   scrubField,
@@ -12,13 +14,6 @@ import { PRESETS, isSafeHarborCompliant } from '@/lib/phi-policy';
 import { sha256 } from '@/lib/hash';
 
 type EngineState = 'idle' | 'loading' | 'ready' | 'error';
-
-interface AigentsConfigDTO {
-  _id: string;
-  name: string;
-  default_chain_title?: string;
-  variables: { notes: string; procedures: string; labs: string };
-}
 
 const FIELD_LABELS: Record<FieldKey, string> = {
   notes:      'Notes (chart records, history, narrative labs)',
@@ -33,6 +28,10 @@ const FIELD_PLACEHOLDERS: Record<FieldKey, string> = {
 };
 
 export default function ResearchExtractionApp() {
+  const configs = useQuery(api.aigentsConfigs.list) ?? [];
+  const createAudit = useMutation(api.audits.create);
+  const sendForward = useAction(api.forward.send);
+
   const [engineState, setEngineState] = useState<EngineState>('idle');
   const [loadProgress, setLoadProgress] = useState<{ pct: number; text: string }>({ pct: 0, text: '' });
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -49,7 +48,6 @@ export default function ResearchExtractionApp() {
     labs:       { field: 'labs',       status: 'pending', chunksTotal: 0, chunksDone: 0, redactions: 0 }
   });
 
-  const [configs, setConfigs] = useState<AigentsConfigDTO[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const [chainTitleOverride, setChainTitleOverride] = useState<string>('');
   const [auditId, setAuditId] = useState<string | null>(null);
@@ -57,16 +55,8 @@ export default function ResearchExtractionApp() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    fetch('/api/deident/aigents-configs')
-      .then(r => r.json())
-      .then(d => {
-        if (d.success) {
-          setConfigs(d.data);
-          if (d.data.length > 0) setSelectedConfigId(d.data[0]._id);
-        }
-      })
-      .catch(() => { /* page still works without configs loaded */ });
-  }, []);
+    if (configs.length > 0 && !selectedConfigId) setSelectedConfigId(configs[0]._id);
+  }, [configs, selectedConfigId]);
 
   async function handleLoadModel() {
     setEngineState('loading');
@@ -88,13 +78,13 @@ export default function ResearchExtractionApp() {
     setForwardResult(null);
     setAuditId(null);
 
-    const policy = PRESETS.internal_research; // v1: hard-coded preset
+    const policy = PRESETS.internal_research;
     const map = new IdentifierMap();
     const newCleansed: Record<FieldKey, string> = { notes: '', procedures: '', labs: '' };
     const fieldOrder: FieldKey[] = ['notes', 'procedures', 'labs'];
 
     const startedAt = Date.now();
-    const engine = (await loadEngine());
+    const engine = await loadEngine();
 
     try {
       for (const field of fieldOrder) {
@@ -118,14 +108,13 @@ export default function ResearchExtractionApp() {
       const inputSha  = await sha256(fieldOrder.map(f => inputs[f]).join('\n---\n'));
       const outputSha = await sha256(fieldOrder.map(f => newCleansed[f]).join('\n---\n'));
 
-      const auditBody = {
+      const id = await createAudit({
         doc_id: crypto.randomUUID(),
-        fields: Object.fromEntries(fieldOrder.map(f => [f, {
-          original_chars: inputs[f].length,
-          cleansed_chars: newCleansed[f].length,
-          chunks: progress[f].chunksTotal,
-          redactions: progress[f].redactions
-        }])),
+        fields: {
+          notes:      fieldStatsFor('notes',      inputs, newCleansed, progress),
+          procedures: fieldStatsFor('procedures', inputs, newCleansed, progress),
+          labs:       fieldStatsFor('labs',       inputs, newCleansed, progress)
+        },
         combined: {
           input_sha256: inputSha,
           output_sha256: outputSha,
@@ -142,15 +131,8 @@ export default function ResearchExtractionApp() {
                                 'FACIAL_PHOTO_REF', 'OTHER_UNIQUE_ID'],
           preserved_categories: ['MRN', 'PROVIDER_NAME', 'VISIT_DATE']
         }
-      };
-
-      const auditRes = await fetch('/api/deident/audit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(auditBody)
       });
-      const auditJson = await auditRes.json();
-      if (auditJson.success) setAuditId(auditJson.data._id);
+      setAuditId(id as string);
     } catch (err) {
       console.error(err);
     } finally {
@@ -160,7 +142,7 @@ export default function ResearchExtractionApp() {
 
   async function handleSendToAigents() {
     if (!selectedConfigId) return;
-    const config = configs.find(c => c._id === selectedConfigId);
+    const config = configs.find((c: { _id: string }) => c._id === selectedConfigId);
     if (!config) return;
 
     setBusy(true);
@@ -177,16 +159,15 @@ export default function ResearchExtractionApp() {
           [config.variables.labs]:       cleansed.labs
         }
       };
-      const r = await fetch('/api/deident/forward', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config_id: selectedConfigId, audit_id: auditId, payload })
+      const r = await sendForward({
+        config_id: selectedConfigId as never,
+        audit_id: (auditId ?? undefined) as never,
+        payload
       });
-      const j = await r.json();
       setForwardResult({
-        ok: j.success === true,
-        chain_run_id: j.chain_run_id,
-        error: j.success ? undefined : (j.message || j.error)
+        ok: r.success === true,
+        chain_run_id: r.chain_run_id,
+        error: r.success ? undefined : (r.error || `HTTP ${r.status}`)
       });
     } catch (err) {
       setForwardResult({ ok: false, error: (err as Error).message });
@@ -204,15 +185,13 @@ export default function ResearchExtractionApp() {
 
   return (
     <div className="space-y-8">
-      {/* Synthetic-data banner */}
       <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
         <strong>Synthetic / authorized research data only.</strong> This tool de-identifies text in
-        your browser via a local AI model — no PHI is sent to any server until you click
-        Send to Aigents, at which point the cleansed text (with names, DOBs, etc. redacted) is
-        forwarded for analysis.
+        your browser via a local AI model — no PHI is sent to any server until you click Send to
+        Aigents, at which point the cleansed text (with names, DOBs, etc. redacted) is forwarded
+        for analysis.
       </div>
 
-      {/* Model loader */}
       <section className="rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-lg font-semibold mb-2">1. Load the local model</h2>
         {engineState === 'idle' && (
@@ -244,7 +223,6 @@ export default function ResearchExtractionApp() {
         )}
       </section>
 
-      {/* Three input fields */}
       <section className="rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-lg font-semibold mb-4">2. Paste source text into each field</h2>
         <div className="space-y-4">
@@ -272,13 +250,13 @@ export default function ResearchExtractionApp() {
         </div>
       </section>
 
-      {/* Aigents handoff */}
       <section className="rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-lg font-semibold mb-4">3. Send to Aigents</h2>
         {configs.length === 0 ? (
           <div className="text-sm text-zinc-600 dark:text-zinc-400">
-            No Aigents configs available. Ask an admin to add one (or run{' '}
-            <code className="px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">npm run seed:aigents</code>).
+            No Aigents configs available. An admin needs to create one (call{' '}
+            <code className="px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">api.aigentsConfigsAdmin.create</code>{' '}
+            via the Convex dashboard or CLI).
           </div>
         ) : (
           <div className="space-y-4">
@@ -289,7 +267,7 @@ export default function ResearchExtractionApp() {
                 onChange={e => setSelectedConfigId(e.target.value)}
                 className="mt-1 block w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-800"
               >
-                {configs.map(c => (
+                {configs.map((c: { _id: string; name: string; default_chain_title?: string }) => (
                   <option key={c._id} value={c._id}>
                     {c.name}{c.default_chain_title ? ` → ${c.default_chain_title}` : ''}
                   </option>
@@ -302,7 +280,7 @@ export default function ResearchExtractionApp() {
                 type="text"
                 value={chainTitleOverride}
                 onChange={e => setChainTitleOverride(e.target.value)}
-                placeholder={configs.find(c => c._id === selectedConfigId)?.default_chain_title || 'chain_title'}
+                placeholder={configs.find((c: { _id: string; default_chain_title?: string }) => c._id === selectedConfigId)?.default_chain_title || 'chain_title'}
                 className="mt-1 block w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-800"
               />
             </label>
@@ -329,6 +307,20 @@ export default function ResearchExtractionApp() {
       </section>
     </div>
   );
+}
+
+function fieldStatsFor(
+  field: FieldKey,
+  inputs: Record<FieldKey, string>,
+  cleansed: Record<FieldKey, string>,
+  progress: Record<FieldKey, FieldProgress>
+) {
+  return {
+    original_chars: inputs[field].length,
+    cleansed_chars: cleansed[field].length,
+    chunks: progress[field].chunksTotal,
+    redactions: progress[field].redactions
+  };
 }
 
 function FieldInput({
